@@ -1,0 +1,480 @@
+##Clean-up Pre-Run##
+rm(list=ls())
+####################
+
+##Start Timer##
+start_time <- Sys.time()
+###############
+
+
+##Packages##
+require(DBI)
+require(RPostgreSQL)
+require(keyringr)
+require(plyr)
+require(readr)
+require(sqldf)
+library(RPushbullet)
+library(readxl)
+require(WriteXLS)
+############
+
+##Generate Reports URL to be downloaded##
+
+A1 <- read_excel("C:/Users/khairy.mohd/Desktop/TESTS/tableau_report.xlsx")
+A2 <- data.frame(col1 = character(),
+                 stringsAsFactors = FALSE)
+
+for(a in 1:nrow(A1))
+{
+  x <- A1[a,1]
+  x <- gsub("http://tableau.ad.mdrevolution.com/#/views/","",x)
+  x <- substr(x,1,data.frame(gregexpr(":",x))[1,1]-2)
+  
+  temp <- strsplit(x, "/")
+  mat  <- matrix(unlist(temp), ncol=2, byrow=TRUE)
+  df   <- as.data.frame(mat)
+  colnames(df) <- c('workbook_name','sheet_name')
+  df$pdf_page[1] <- paste("report",a,sep='_')
+  
+  A2 <- rbind(A2,cbind(A1[a,1],df))  
+}
+
+WriteXLS(A2,"C:/Users/khairy.mohd/Desktop/TESTS/tableau_report.xlsx",BoldHeaderRow = TRUE,AdjWidth = TRUE)
+
+#########################################
+
+
+##Path/destination for files##
+path <- "C:/Users/khairy.mohd/Desktop/TESTS/Tableau_Download"
+dest <- paste("C:\\Users\\khairy.mohd\\Box\\Client Services Team\\Accounts\\Chronic Care Management (CCM)\\Greenway\\Greenway Client Files")
+dest2 <- paste("C:\\Users\\khairy.mohd\\Box\\Client Services Team\\Accounts\\Chronic Care Management (CCM)\\Enterprise Accounts")
+#############################
+
+##Query from database account list##
+query <- "SELECT ac.name as account_name,ic.code as site_code,
+                  CASE WHEN LOWER(ehr.name) LIKE '%greenway%' THEN 'GRNW'
+                      ELSE 'NOT_GRNW' END as ehr,
+                  ac.account_manager_name,ac.account_manager_email,ac.account_manager_phone
+          FROM accounts ac 
+              INNER JOIN integration_configurations ic ON (ac.integration_configuration_id = ic.id)
+                  INNER JOIN ehrs ehr ON (ic.ehr_id = ehr.id)
+          WHERE ac.active = TRUE
+              AND ic.code NOT IN ('TSTM')"
+
+query2 <- "SELECT account_name,site_code,practice_name FROM billing_ledger
+          WHERE billing_period_start::date = make_date(date_part('year',make_date(date_part('year',current_date)::int,date_part('month',current_date)::int,1)-1)::int,date_part('month',make_date(date_part('year',current_date)::int,date_part('month',current_date)::int,1)-1)::int,1)
+          GROUP BY account_name,site_code,practice_name"
+
+#Encryption
+pw <- {
+  decrypt_dpapi_pw(paste(Sys.getenv("USERPROFILE"), '\\DPAPI\\passwords\\', Sys.info()["nodename"], '\\', "PostgreSQL", '.txt', sep=""))
+}
+
+# loads the PostgreSQL driver
+drv <- dbDriver("PostgreSQL")
+# creates a connection to the postgres database
+# note that "con" will be used later in each connection to the database
+con <- dbConnect(drv, dbname = "mdrev_ccm3_production",
+                 host = "mdrsql03", port = 5432,
+                 user = "abailey", password = pw)
+
+
+dbExistsTable(con, "billing_ledger")
+
+Account_list <- dbGetQuery(con,query)
+Account_multi_sites <- dbGetQuery(con,query2)
+
+
+
+dbDisconnect(con)
+detach("package:RPostgreSQL", unload=TRUE)
+####################################
+
+##Creating folders in path##
+for(i in 1:nrow(Account_list))#nrow(Account_list)
+{
+  if(file.exists(paste(path,"/",Account_list$account_name[i],sep='')) == FALSE)
+  {
+    dir.create(paste(path,"/",Account_list$account_name[i],sep=''))
+  }else{
+    print("File Exist")
+  }
+  dir.create(paste(path,"/",Account_list$account_name[i],"/",Sys.Date(),sep=''))
+}
+############################
+
+##Create multi-site accounts 10/09/2018##
+
+Account_multi_sites_delete <- data.frame(site_code = character(4),stringsAsFactors = FALSE)
+
+for(i in 1:nrow(Account_multi_sites))
+{
+  if(Account_multi_sites[i,3] == Account_multi_sites[i,2] | Account_multi_sites[i,3] == Account_multi_sites[i,1])
+  {
+    Account_multi_sites_delete[i,1] <- as.character(trimws(Account_multi_sites[i,2],"both"))
+  }else{
+    print("no_delete")
+  }
+}
+
+Account_multi_sites_delete <- sqldf('SELECT * FROM Account_multi_sites_delete WHERE site_code IS NOT NULL')
+Account_multi_sites <- sqldf('
+                             SELECT ams.* FROM Account_multi_sites ams 
+                             LEFT JOIN Account_multi_sites_delete amsd ON (ams.site_code = amsd.site_code)
+                             WHERE amsd.site_code IS NULL
+                             AND ams.site_code NOT IN ("MDTN")
+                             ORDER BY site_code
+                             ')
+
+Account_multi_sites$practice_name_tableau <- gsub(' ','%20',Account_multi_sites$practice_name)
+
+Account_list <- sqldf('
+                       SELECT al.*,"FALSE" as multi_site FROM Account_list al 
+                         LEFT JOIN Account_multi_sites ams ON (al.site_code = ams.site_code)
+                       WHERE ams.site_code IS NULL
+                       UNION
+                       SELECT al.*,"TRUE" as multi_site FROM Account_list al 
+                         INNER JOIN Account_multi_sites ams ON (al.site_code = ams.site_code)
+                     ')
+
+#########################################
+
+
+
+##Check for empty tableau##
+shell(paste('cd C:/Program Files/Tableau/Tableau Server/2018.1/extras/Command Line Utility && tabcmd logout && tabcmd login -s http://tableau.ad.mdrevolution.com -u khairy.mohd -p ',decrypt_dpapi_pw(paste(Sys.getenv("USERPROFILE"), '\\DPAPI\\passwords\\', Sys.info()["nodename"], '\\','tableau_server','.txt', sep="")),' && tabcmd get "/views/REPORTTOAUTOMATE_0/QASheet.csv" -f "C:/Users/khairy.mohd/Desktop/TESTS/Tableau_Download/QA_SHEET.csv"',sep=''))
+
+QA_SHEET <- read_csv("C:/Users/khairy.mohd/Desktop/TESTS/Tableau_Download/QA_SHEET.csv")
+
+file.remove("C:/Users/khairy.mohd/Desktop/TESTS/Tableau_Download/QA_SHEET.csv")
+
+non_empty_tableau <- data.frame(col1 = character(),
+                                stringsAsFactors = FALSE)
+
+for(a in 1:nrow(Account_list))
+{
+  test_check <- sqldf(
+    paste("SELECT `Site Code`,`Month of Billing Period Start`,COUNT(DISTINCT(`Patient Id`)) as Count_pt FROM QA_SHEET WHERE `Site Code` = '",Account_list[a,2],"' GROUP BY `Site Code`,`Month of Billing Period Start` ORDER BY `Month of Billing Period Start` DESC",sep='')
+  )
+  
+  #Creating a list of Non-Empty tableau
+  if(nrow(test_check) != 0)
+  {
+    for(o in 1:nrow(test_check))
+    {
+      if(test_check[o,2] == format(as.Date(format(Sys.Date(),'%Y-%m-01'))-1,'%B %Y') && test_check[o,3] != 0)
+      {
+        non_empty_tableau[a,1] <- as.character(test_check[o,1])
+      }
+    }
+  }else{
+    print(paste("Skip Accounts with Empty Tableau ",Account_list[a,2],sep=''))
+  }
+  
+}
+
+non_empty_tableau <- sqldf('SELECT * FROM non_empty_tableau WHERE col1 IS NOT NULL')
+
+Account_list <- sqldf('SELECT AL.* FROM Account_list AL 
+                        INNER JOIN non_empty_tableau N ON (AL.site_code = N.col1)')
+###########################
+
+
+##Specific Account Uploads##
+override <- TRUE
+date_override <- "02/21/2019"
+date_override <- as.Date(date_override, format='%m/%d/%Y')
+
+if(override == TRUE && date_override == Sys.Date())
+{
+  
+  Account_list <- sqldf("
+                        SELECT * FROM Account_list
+                        WHERE site_code = 'FLMC'
+                        ") 
+  
+  ##TEMPORARY##
+  # Account_list$multi_site[which(Account_list$site_code == 'MELB')] = FALSE
+  # Account_list$multi_site[which(Account_list$site_code == 'VHEL')] = FALSE
+  # Account_list$multi_site[which(Account_list$site_code == 'ETMC')] = FALSE
+  #Account_list$multi_site[which(Account_list$site_code == 'PCMA')] = FALSE
+  #############
+  
+}else{
+  print("No Override")
+}
+##########################
+
+Account_list_2 <- Account_list
+Account_list$multi_site <- FALSE
+
+
+##RUNNING CMD##
+##DOWNLOADING & UPLOADING MONTHLY REPORTS into staging##
+for(i in 74:nrow(Account_list))#nrow(Account_list)
+{
+  if(Account_list$multi_site[i] == FALSE)
+  {
+    ##DOWNLOADING PDFS from TABLEAU##
+    
+    shell(paste('cd C:/Program Files/Tableau/Tableau Server/2018.1/extras/Command Line Utility && tabcmd logout && tabcmd login -s http://tableau.ad.mdrevolution.com -u khairy.mohd -p ',decrypt_dpapi_pw(paste(Sys.getenv("USERPROFILE"), '\\DPAPI\\passwords\\', Sys.info()["nodename"], '\\','tableau_server','.txt', sep="")),' && tabcmd get "/views/REPORTTOAUTOMATE_0/ActivationsandBillableLives?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/EnrollmentTracking?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/EscalationReportSummary?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/MonthlyEngagedbyTypedash?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/MonthlyEngagementbytype?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/PatientEnteredVitals?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/DeactivationsPerProviderPerMonth?Site%20Code=',Account_list[i,2],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" && tabcmd logout',sep=''))
+    
+    ##NEW CODE##
+    ##############################################################
+    
+    # library(readxl)
+    # library(readtext)
+    #  
+    # tableau_report <- read_excel("C:/Users/khairy.mohd/Desktop/TESTS/tableau_report.xlsx")
+    #  
+    # sink("C:/Users/khairy.mohd/Desktop/Client Services Tableau/Working/test2.txt")
+    # 
+    # cat('cd C:/Program Files/Tableau/Tableau Server/2018.1/extras/Command Line Utility && tabcmd logout && tabcmd login -s http://tableau.ad.mdrevolution.com -u khairy.mohd -p Enzo7687xry!@#$ && ')
+    # 
+    # for(i in 1:1)#nrow(Account_list)
+    # {
+    #   for(a in 1:nrow(tableau_report))
+    #   {
+    #     cat(paste('tabcmd get "/views/',tableau_report$workbook_name[a],'/',tableau_report$sheet_name[a],'?Site%20Code=',Account_list[i,2],'" -f "',path,'/',Account_list[i,1],'/',Sys.Date(),'/',tableau_report$pdf_page[a],'.pdf" && ',sep=''))
+    #   }
+    # }
+    # 
+    # cat('tabcmd logout')
+    #  
+    # sink()
+    #
+    # shell(paste(readtext("C:/Users/khairy.mohd/Desktop/Client Services Tableau/Working/test2.txt", text_field = "texts")))
+    
+    ##############################################################
+  }else if(Account_list$multi_site[i] == TRUE)
+  {
+    #DOWNLOADING PDFS from TABLEAU FOR MULTI SITES
+    Account_multi_sites_sub <- subset(Account_multi_sites,Account_multi_sites$site_code == Account_list$site_code[i])
+    rownames(Account_multi_sites_sub) <- 1:nrow(Account_multi_sites_sub)
+    
+    for(j in 1:nrow(Account_multi_sites_sub))
+    {
+      shell(paste('cd C:/Program Files/Tableau/Tableau Server/2018.1/extras/Command Line Utility && tabcmd logout && tabcmd login -s http://tableau.ad.mdrevolution.com -u khairy.mohd -p ',decrypt_dpapi_pw(paste(Sys.getenv("USERPROFILE"), '\\DPAPI\\passwords\\', Sys.info()["nodename"], '\\','tableau_server','.txt', sep="")),' && tabcmd get "/views/REPORTTOAUTOMATE_0/ActivationsandBillableLives?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/EnrollmentTracking?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/EscalationReportSummary?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/MonthlyEngagedbyTypedash?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/MonthlyEngagementbytype?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/PatientEnteredVitals?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" && tabcmd get "/views/REPORTTOAUTOMATE_0/DeactivationsPerProviderPerMonth?Site%20Code=',Account_list[i,2],'&Practice%20Name=',Account_multi_sites_sub$practice_name_tableau[j],'" -f "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" && tabcmd logout',sep=''))
+    }
+    
+    print(paste('Running Multi-site : ',unique(Account_multi_sites_sub$account_name),sep=''))
+  }else{
+    print("ERROR")
+  }
+
+  print(paste("Current Site :",i,sep=''))  
+  #################################
+
+  ##Combining PDFS AND UPLOAD##
+  
+  if(Account_list$ehr[i] == "NOT_GRNW")
+  {
+   if(Account_list$multi_site[i] == FALSE)
+   {
+     
+     ##USE NEW CODE TO GENERATE SHELL SCRIPT BELOW
+     
+     # shell(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" cat output "',dest2,'\\',Account_list[i,1],'\\Monthly Reports\\',Sys.Date(),'_CCM Monthly Report.pdf"',sep=''))
+     
+     report_folder_list <- data.frame(dir(paste(dest2,"/",Account_list[i,1],"/Monthly Reports/",format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),sep='')))
+     for(j in 1:nrow(report_folder_list))
+     {
+       if(format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B') == substr(report_folder_list[j,1],5,nchar(as.character(report_folder_list[j,1]))))
+       {
+         
+         shell(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" cat output "',dest2,'\\',Account_list[i,1],'\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B %Y'),'_CCM Monthly Report.pdf"',sep=''))
+         
+         print(paste(dest2,'\\',Account_list[i,1],'\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B %Y'),'_CCM Monthly Report.pdf"',sep=''))
+         break()
+       }else{
+         print("Nothing")
+       }
+     }
+     #############################################
+     
+     ##NEW CODE##
+     ##############################################################
+     
+     # library(readxl)
+     # library(readtext)
+     # 
+     # tableau_report <- read_excel("C:/Users/khairy.mohd/Desktop/TESTS/tableau_report.xlsx")
+     #  
+     # sink("C:/Users/khairy.mohd/Desktop/Client Services Tableau/Working/test.txt")
+     #  
+     # cat(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk ',sep=''))
+     # 
+     # for(i in 1:1)#nrow(Account_list)
+     # {
+     #   for(a in 1:nrow(tableau_report))
+     #   {
+     #     cat(paste('"',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\',tableau_report$pdf_page[a],'.pdf" ',sep=''))
+     #   }
+     # }
+     # 
+     # cat(paste('cat output "',dest2,Account_list[i,1],'\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',Sys.Date(),'_CCM Monthly Report.pdf"',sep=''))
+     #  
+     # sink()
+     #  
+     # shell(paste(readtext("C:/Users/khairy.mohd/Desktop/Client Services Tableau/Working/test.txt", text_field = "texts")))
+     
+     ############################################################
+     
+   }else if(Account_list$multi_site[i] == TRUE)
+   {
+     
+     # #PDF FOR MULTI SITES
+     report_folder_list <- data.frame(dir(paste(dest2,"/",Account_list[i,1],"/Monthly Reports/",format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),sep='')))
+     for(j in 1:nrow(report_folder_list))
+     {
+       if(format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B') == substr(report_folder_list[j,1],5,nchar(as.character(report_folder_list[j,1]))))
+       {
+         
+         shell(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" cat output "',dest2,'\\',Account_list[i,1],'\\','\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B %Y'),'_CCM Monthly Report_',Account_multi_sites_sub$practice_name[j],'.pdf"',sep=''))
+         
+         print(paste(dest2,'\\',Account_list[i,1],'\\','\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B %Y'),'_CCM Monthly Report_',Account_multi_sites_sub$practice_name[j],'.pdf"',sep=''))
+         break()
+       }else{
+         print("Nothing")
+       }
+     }
+     
+   }else{
+     print("ERROR")
+   }
+
+    #############################
+    
+  }else if(Account_list$ehr[i] == "GRNW")
+  {
+    if(Account_list$multi_site[i] == FALSE)
+    {
+      ##Combining PDFS
+      ##USE NEW CODE TO GENERATE SHELL SCRIPT BELOW
+      
+      # shell(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" cat output "',dest,'\\',Account_list[i,1],'\\Monthly Reports\\',Sys.Date(),'_CCM Monthly Report.pdf"',sep=''))
+      
+      report_folder_list <- data.frame(dir(paste(dest,"/",Account_list[i,1],"/Monthly Reports/",format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),sep='')))
+      for(j in 1:nrow(report_folder_list))
+      {
+        if(format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B') == substr(report_folder_list[j,1],5,nchar(as.character(report_folder_list[j,1]))))
+        {
+          
+          shell(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\provider_report_1.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\enrollment_tracking_2.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\escalation_report_3.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_4.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\monthly_engage_by_type_sum_5.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\vitals_by_month_6.pdf" "',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\deactivations_by_month_7.pdf" cat output "',dest,'\\',Account_list[i,1],'\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B %Y'),'_CCM Monthly Report.pdf"',sep=''))
+          
+          print(paste(dest,'\\',Account_list[i,1],'\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%B %Y'),'_CCM Monthly Report.pdf"',sep=''))
+          break()
+        }else{
+          print("Nothing")
+        }
+      }
+      #############################################
+      
+      ##NEW CODE##
+      ##############################################################
+      
+      # library(readxl)
+      # library(readtext)
+      # 
+      # tableau_report <- read_excel("C:/Users/khairy.mohd/Desktop/TESTS/tableau_report.xlsx")
+      #  
+      # sink("C:/Users/khairy.mohd/Desktop/Client Services Tableau/Working/test.txt")
+      #  
+      # cat(paste('cd C:/Program Files (x86)/PDFtk Server/bin && pdftk ',sep=''))
+      # 
+      # for(i in 1:1)#nrow(Account_list)
+      # {
+      #   for(a in 1:nrow(tableau_report))
+      #   {
+      #     cat(paste('"',path,'\\',Account_list[i,1],'\\',Sys.Date(),'\\',tableau_report$pdf_page[a],'.pdf" ',sep=''))
+      #   }
+      # }
+      # 
+      # cat(paste('cat output "',dest,Account_list[i,1],'\\Monthly Reports\\',format(as.Date(format(Sys.time(),'%Y-%m-01'))-1,'%Y'),'\\',report_folder_list[j,1],'\\',Sys.Date(),'_CCM Monthly Report.pdf"',sep=''))
+      #  
+      # sink()
+      #  
+      # shell(paste(readtext("C:/Users/khairy.mohd/Desktop/Client Services Tableau/Working/test.txt", text_field = "texts")))
+      
+      ############################################################
+    }else if(Account_list$multi_site[i] == TRUE)
+    {
+      #PDF FOR MULTI SITES
+      print("")
+    }else{
+      print("ERROR")
+    }
+    
+  }else{
+    print('ERROR')
+  }
+  
+  ##Create a pause every 5 accounts to prevent errors##
+  if( i %% 1 == 0)
+  {
+    pause <- round(runif(1,30,60),2)
+    paste("Pausing for ",pause," seconds",sep='')
+    Sys.sleep(pause)
+  }else{
+      print("No Pause")
+  }
+  #####################################################
+}
+
+##Text/Push Alerts to receipients## 
+time_diff <- round(Sys.time() - start_time,2)
+paste("Script Finished Running at ",start_time," :: Script Finished Running at ",Sys.time()," :: Elapse time ",time_diff,sep='')
+
+pbPost(title=paste("Script Finished Running at ",start_time," :: Script Finished Running at ",Sys.time()," :: Elapse time ",time_diff,sep=''),
+       apikey=decrypt_dpapi_pw(paste(Sys.getenv("USERPROFILE"), '\\DPAPI\\passwords\\', Sys.info()["nodename"], '\\', "Pushbullet", '.txt', sep="")), #API key is found in account settings
+       devices="ujAW8CT0VVYsjAiVsKnSTs")
+##################################
+
+##Outlook email Notification 10/08/2018##
+
+email_recipient <- c('michael.kaye@mdrevolution.com','todd@mdrevolution.com','tyler.dabovich@mdrevolution.com')
+email_recipient <- data.frame(email_recipient)
+
+library(RDCOMClient)
+
+for(e in 1:nrow(email_recipient))
+{
+  recipient <- as.character(email_recipient[e,1])#khairy.mohd@mdrevolution.com
+  subject_line <- "AUTOMATED MESSAGE : Monthly Report Distribution Confirmation" 
+  #attachment <- "C:/Users/khairy.mohd/Desktop/Centro List NPO/QA/2018-10-08_New_Patient_Onboarding_QA.csv"
+  body_message <- paste('Monthly reports distributed at ',Sys.Date(),sep='')
+  
+  
+  #init com api
+  OutApp <- COMCreate("Outlook.Application")
+  #create an email 
+  outMail = OutApp$CreateItem(0)
+  outMail$GetInspector()
+  signature = outMail[["HTMLBody"]]
+  #configure  email parameter 
+  outMail[["To"]] = recipient
+  outMail[["subject"]] = subject_line
+  #outMail[["Attachments"]]$Add(attachment)
+  #outMail[["body"]] = body_message
+  outMail[["HTMLBody"]] = paste("<p>",body_message,signature, "</p>",sep='')
+  #send it                     
+  outMail$Send()
+  
+  ##to add attachment##
+  #outMail[["Attachments"]]$Add(path_to_attch_file)
+  #####################
+  
+  ##Send from secondary inbox##
+  #outMail[["SentOnBehalfOfName"]] = "yoursecondary@mail.com"
+  #############################  
+
+  print(paste('Email sent to ',recipient,sep=''))
+}
+
+#########################################
+
+
+
+
+
